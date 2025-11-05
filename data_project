@@ -1,0 +1,189 @@
+-- Drop if exists for repeatable runs
+--DROP TABLE IF EXISTS issue_records;
+--DROP TABLE IF EXISTS book_copies;
+--DROP TABLE IF EXISTS books;
+--DROP TABLE IF EXISTS members;
+--DROP TABLE IF EXISTS categories;
+--DROP TABLE IF EXISTS authors;
+--DROP TABLE IF EXISTS book_authors;
+
+-- Categories
+CREATE TABLE categories (
+  category_id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(100) NOT NULL UNIQUE
+);
+
+-- Books (logical book metadata)
+CREATE TABLE books (
+  book_id INT AUTO_INCREMENT PRIMARY KEY,
+  title VARCHAR(255) NOT NULL,
+  isbn VARCHAR(20),
+  publisher VARCHAR(150),
+  year YEAR,
+  category_id INT,
+  total_copies INT DEFAULT 0,
+  CONSTRAINT fk_books_category FOREIGN KEY (category_id) REFERENCES categories(category_id)
+);
+
+-- Authors (optional)
+CREATE TABLE authors (
+  author_id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(150) NOT NULL
+);
+
+-- Many-to-many book_authors
+CREATE TABLE book_authors (
+  book_id INT NOT NULL,
+  author_id INT NOT NULL,
+  PRIMARY KEY (book_id, author_id),
+  CONSTRAINT fk_ba_book FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE,
+  CONSTRAINT fk_ba_author FOREIGN KEY (author_id) REFERENCES authors(author_id) ON DELETE CASCADE
+);
+
+-- Physical copies
+CREATE TABLE book_copies (
+  copy_id INT AUTO_INCREMENT PRIMARY KEY,
+  book_id INT NOT NULL,
+  accession_no VARCHAR(50) UNIQUE, -- optional human-readable id
+  status ENUM('available','issued','lost','maintenance') DEFAULT 'available',
+  CONSTRAINT fk_copy_book FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE
+);
+
+-- Members (students, staff, etc.)
+CREATE TABLE members (
+  member_id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(150) NOT NULL,
+  email VARCHAR(150) UNIQUE,
+  phone VARCHAR(30),
+  address VARCHAR(255),
+  join_date DATE DEFAULT (CURRENT_DATE),
+  membership_type ENUM('student','staff','guest') DEFAULT 'student'
+);
+
+-- Issue records (transactions)
+CREATE TABLE issue_records (
+  issue_id INT AUTO_INCREMENT PRIMARY KEY,
+  copy_id INT NOT NULL,
+  member_id INT NOT NULL,
+  issue_date DATE NOT NULL DEFAULT (CURRENT_DATE),
+  due_date DATE NOT NULL,
+  return_date DATE NULL,
+  fines DECIMAL(8,2) DEFAULT 0.00,
+  CONSTRAINT fk_issue_copy FOREIGN KEY (copy_id) REFERENCES book_copies(copy_id),
+  CONSTRAINT fk_issue_member FOREIGN KEY (member_id) REFERENCES members(member_id)
+);
+
+-- Useful indexes
+CREATE INDEX idx_books_title ON books(title);
+CREATE INDEX idx_members_name ON members(name);
+CREATE INDEX idx_issue_copy ON issue_records(copy_id);
+CREATE INDEX idx_issue_member ON issue_records(member_id);
+
+-- categories
+INSERT INTO categories (name) VALUES ('Computer Science'), ('Fiction'), ('Science'), ('History');
+
+-- authors
+INSERT INTO authors (name) VALUES ('Donald Knuth'), ('George Orwell'), ('Stephen Hawking');
+
+-- books
+INSERT INTO books (title, isbn, publisher, year, category_id, total_copies)
+VALUES
+('The Art of Computer Programming', '9780201896831', 'Addison-Wesley', 1997, 1, 2),
+('1984', '9780451524935', 'Secker & Warburg', 1949, 2, 3),
+('A Brief History of Time', '9780553380163', 'Bantam', 1988, 3, 1);
+
+-- book_authors
+INSERT INTO book_authors (book_id, author_id) VALUES (1,1), (2,2), (3,3);
+
+-- create physical copies (match total_copies above)
+INSERT INTO book_copies (book_id, accession_no) VALUES
+(1,'A001'), (1,'A002'),
+(2,'B001'), (2,'B002'), (2,'B003'),
+(3,'C001');
+
+-- members
+INSERT INTO members (name, email, phone, address, membership_type) VALUES
+('Riya Sharma','riya@example.com','+91-9876543210','Delhi','student'),
+('Aman Verma','aman@example.com','+91-9123456780','Mumbai','staff');
+
+-- issue one book to Riya
+INSERT INTO issue_records (copy_id, member_id, issue_date, due_date)
+VALUES (1, 1, CURDATE(), DATE_ADD(CURDATE(), INTERVAL 14 DAY));
+-- Mark that copy as issued
+UPDATE book_copies SET status='issued' WHERE copy_id=1;
+
+SELECT b.book_id, b.title, b.isbn, b.total_copies,
+  SUM(case when bc.status='available' then 1 else 0 end) AS available_copies
+FROM books b
+LEFT JOIN book_copies bc ON b.book_id = bc.book_id
+GROUP BY b.book_id, b.title, b.isbn, b.total_copies;
+
+SELECT ir.issue_id, b.title, bc.accession_no, m.name AS member, ir.issue_date, ir.due_date, ir.return_date
+FROM issue_records ir
+JOIN book_copies bc ON ir.copy_id = bc.copy_id
+JOIN books b ON bc.book_id = b.book_id
+JOIN members m ON ir.member_id = m.member_id
+WHERE ir.return_date IS NULL;
+
+SELECT ir.issue_id, m.name, b.title, ir.due_date, DATEDIFF(CURDATE(), ir.due_date) AS days_overdue
+FROM issue_records ir
+JOIN book_copies bc ON ir.copy_id = bc.copy_id
+JOIN books b ON bc.book_id = b.book_id
+JOIN members m ON ir.member_id = m.member_id
+WHERE ir.return_date IS NULL AND ir.due_date < CURDATE();
+
+SELECT m.name, b.title, ir.issue_date, ir.due_date, ir.return_date
+FROM issue_records ir
+JOIN members m ON ir.member_id = m.member_id
+JOIN book_copies bc ON ir.copy_id = bc.copy_id
+JOIN books b ON bc.book_id = b.book_id
+WHERE m.member_id = 1
+ORDER BY ir.issue_date DESC;
+
+-- Procedure to issue a specific copy to a member (MySQL)
+DROP PROCEDURE IF EXISTS issue_book;
+DELIMITER //
+CREATE PROCEDURE issue_book(IN in_copy_id INT, IN in_member_id INT, IN loan_days INT)
+BEGIN
+  DECLARE v_status VARCHAR(20);
+  SELECT status INTO v_status FROM book_copies WHERE copy_id = in_copy_id FOR UPDATE;
+  IF v_status IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Copy not found';
+  ELSEIF v_status <> 'available' THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Copy not available';
+  ELSE
+    INSERT INTO issue_records(copy_id, member_id, issue_date, due_date)
+    VALUES (in_copy_id, in_member_id, CURDATE(), DATE_ADD(CURDATE(), INTERVAL loan_days DAY));
+    UPDATE book_copies SET status='issued' WHERE copy_id = in_copy_id;
+  END IF;
+END //
+DELIMITER ;
+
+-- Procedure to return a book
+DROP PROCEDURE IF EXISTS return_book;
+DELIMITER //
+CREATE PROCEDURE return_book(IN in_issue_id INT)
+BEGIN
+  DECLARE v_copy INT;
+  DECLARE v_due DATE;
+  SELECT copy_id, due_date INTO v_copy, v_due FROM issue_records WHERE issue_id = in_issue_id AND return_date IS NULL FOR UPDATE;
+  IF v_copy IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Active issue record not found';
+  ELSE
+    UPDATE issue_records SET return_date = CURDATE(),
+      fines = GREATEST(DATEDIFF(CURDATE(), v_due) * 1.00, 0) -- example fine: 1.00 per day
+    WHERE issue_id = in_issue_id;
+    UPDATE book_copies SET status='available' WHERE copy_id = v_copy;
+  END IF;
+END //
+DELIMITER ;
+
+CREATE VIEW v_current_issues AS
+SELECT ir.issue_id, m.name AS member, b.title, bc.accession_no, ir.issue_date, ir.due_date
+FROM issue_records ir
+JOIN book_copies bc ON ir.copy_id = bc.copy_id
+JOIN books b ON bc.book_id = b.book_id
+JOIN members m ON ir.member_id = m.member_id
+WHERE ir.return_date IS NULL;
+
+SELECT *FROM books;
